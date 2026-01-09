@@ -1,0 +1,8 @@
+task: detect  # 任务类型
+model: yolov8n.pt  # 预训练模型路径
+source: images/  # 输入数据（支持图片/视频/RTSP等）
+imgsz: 320  # 输入图像大小
+conf: 0.4  # 置信度阈值
+iou: 0.45  # NMS 交并比阈值
+device: 0  # 设备（0=GPU, 'cpu'=使用CPU）
+half: False  # 是否使用 FP16 推理
