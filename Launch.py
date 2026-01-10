@@ -26,11 +26,11 @@ from stroke import key_stroke, mouse_stroke
 
 # config
 area = 256
-mode = 1 # 0: ai + recoil, 1: only ai, 2: only recoil
+mode = 0 # 0: ai + recoil, 1: only ai, 2: only recoil
 max_dist = area * area // 4
 resolution_x = 2560
 resolution_y = 1440
-conf_c = 0.2
+conf_c = 0.4
 base_recoil = 1
 max_conf_x1, max_conf_y1, max_conf_x2, max_conf_y2 = 0, 0, 0, 0
 person_cls = 0
@@ -300,7 +300,7 @@ def detect_people(frame_p, return_debug=False):
     """
     boxes, scores, clses = ort_model.infer(frame_p, conf_thres=conf_c, iou_thres=0.35, imgsz=area)
 
-    print("unique clses:", np.unique(clses), "max score:", scores.max() if len(scores) else None)
+    #print("unique clses:", np.unique(clses), "max score:", scores.max() if len(scores) else None)
     idx = np.where(clses == person_cls)[0]
     if idx.size == 0:
         empty = {"x1": 0, "y1": 0, "x2": 0, "y2": 0}
@@ -326,7 +326,7 @@ def detect_people(frame_p, return_debug=False):
     aim_y = int((y2 - y1) * 0.75 + y1)
     target = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
-    print("boxes are:", b)
+    #print("boxes are:", b)
 
     if return_debug:
         return target, b, s, k, (aim_x, aim_y)
@@ -407,7 +407,7 @@ def get_movement(p):
     if p["x1"] == 0 and p["y1"] == 0 and p["x2"] == 0 and p["y2"] == 0:
         return 0, 0
     dx = -area//2 + int((p["x1"] + p["x2"]) * 0.5)
-    dy = -area//2 + int((p["y2"] - p["y1"]) * 0.5 + p["y1"])
+    dy = -area//2 + int((p["y2"] - p["y1"]) * 0.3 + p["y1"])
     # abs dx + abs dy < 5
     dp = dx ** 2 + dy ** 2
     if dp < min_d ** 2:
@@ -490,7 +490,7 @@ def auto_recoil():
     while True:
         if on and (mode == 0 or mode == 2) and mouse_down:
             # mouse_move_relative(0, int(base_recoil * (1 + level * 0.1)))
-            mouse_move_relative(0, 4)
+            mouse_move_relative(0, 3)
             time.sleep(0.04)
 
 
@@ -588,16 +588,16 @@ try:
         #print("detect cost:", t3 - t2)
 
         # --- show window ---
-        if debug_show:
-            if debug_show:
-                vis = draw_debug(frame, boxes=p_boxes, scores=p_scores,
-                                 target_idx=chosen_k, aim_point=aim_pt)
-
-                cv2.imshow(win_name, vis)
-
-                key = cv2.waitKey(1) & 0xFF  # ⭐关键：非阻塞刷新
-                # if handle_debug_keys(key):
-                #     break
+        # if debug_show:
+        #     if debug_show:
+        #         vis = draw_debug(frame, boxes=p_boxes, scores=p_scores,
+        #                          target_idx=chosen_k, aim_point=aim_pt)
+        #
+        #         cv2.imshow(win_name, vis)
+        #
+        #         key = cv2.waitKey(1) & 0xFF  # ⭐关键：非阻塞刷新
+        #         # if handle_debug_keys(key):
+        #         #     break
 
         movement = get_movement(position)
         if movement[0] == 0 and movement[1] == 0:
@@ -641,9 +641,9 @@ try:
 
             if dx != 0 or dy != 0:
                 mouse_move_relative(dx, dy)
-            print(f"move dx: {dx}, dy: {dy}")
+            #print(f"move dx: {dx}, dy: {dy}")
 
-        t4 = time.perf_counter()
+    t4 = time.perf_counter()
         #print("move cost: ", t4 - t3)
         #print("loop cost:", t4 - t0)
 finally:
