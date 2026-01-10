@@ -23,19 +23,17 @@ from consts import interception_filter_key_state, interception_filter_mouse_stat
 from stroke import key_stroke, mouse_stroke
 
 
+
 # config
 area = 256
-mode = 0 # 0: ai + recoil, 1: only ai, 2: only recoil
+mode = 1 # 0: ai + recoil, 1: only ai, 2: only recoil
 max_dist = area * area // 4
 resolution_x = 2560
 resolution_y = 1440
-conf_c = 0.4
-model = YOLO('256.onnx', task="detect")
-model.task = "detect"
+conf_c = 0.2
 base_recoil = 1
 max_conf_x1, max_conf_y1, max_conf_x2, max_conf_y2 = 0, 0, 0, 0
 person_cls = 0
-imgsz = 256  # 你原来 predict(imgsz=320)
 
 debug_show = True      # 是否imshow
 debug_draw = True      # 是否画框
@@ -44,7 +42,30 @@ debug_save_dir = "dbg_caps"
 os.makedirs(debug_save_dir, exist_ok=True)
 
 
-def letterbox(im, new_shape=(256, 256), color=(114, 114, 114)):
+smooth_dx, smooth_dy = 0.0, 0.0
+last_dx, last_dy = 0, 0
+
+SMOOTH = 0.10      # 越大越稳但越慢
+MAX_MOVE = 50       # 原来20，先降
+MAX_DELTA = 3      # 每帧变化限制
+AXIS_DEAD = 2      # 单轴死区
+
+so = ort.SessionOptions()
+so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+so.enable_mem_pattern = True
+so.enable_mem_reuse = True
+so.intra_op_num_threads = 1  # 实时场景通常别开太多
+so.inter_op_num_threads = 1
+so.log_severity_level = 3    # 关 warning（不影响性能，只是安静）
+
+cuda_opts = {
+    "cudnn_conv_algo_search": "HEURISTIC",  # 或 "DEFAULT"
+    "arena_extend_strategy": "kNextPowerOfTwo",
+    "do_copy_in_default_stream": 1,         # 有时对延迟更友好
+}
+
+
+def letterbox(im, new_shape=(area, area), color=(114, 114, 114)):
     """Resize + pad to new_shape, keep ratio. Return: padded_img, ratio, (dw, dh)."""
     h, w = im.shape[:2]
     new_w, new_h = new_shape[0], new_shape[1]
@@ -135,21 +156,17 @@ class YOLOv8ONNX:
         if use_cuda and "CUDAExecutionProvider" in providers:
             self.sess = ort.InferenceSession(
                 onnx_path,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+                sess_options=so,
+                providers=[("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
             )
             self.on_gpu = True
-        else:
-            self.sess = ort.InferenceSession(
-                onnx_path,
-                providers=["CPUExecutionProvider"]
-            )
-            self.on_gpu = False
+
 
         self.input_name = self.sess.get_inputs()[0].name
         # 常见是 [1,3,320,320]，但也可能动态
         self.input_shape = self.sess.get_inputs()[0].shape
 
-    def preprocess(self, frame_bgr, imgsz=256):
+    def preprocess(self, frame_bgr, imgsz=area):
         # letterbox
         img, r, (padw, padh) = letterbox(frame_bgr, (imgsz, imgsz))
         # BGR -> RGB
@@ -246,6 +263,7 @@ class YOLOv8ONNX:
         t4 = time.perf_counter()
 
         #print(f"reshape:{t1 - t0:.4f}  cls+filter:{t2 - t1:.4f}  decode:{t3 - t2:.4f}  nms:{t4 - t3:.4f}  total:{t4 - t0:.4f}")
+
         return boxes, scores, clses
 
     def infer(self, frame_bgr, conf_thres=0.4, iou_thres=0.35, imgsz=256):
@@ -254,13 +272,11 @@ class YOLOv8ONNX:
         inp, r, padw, padh = self.preprocess(frame_bgr, imgsz=imgsz)
         time_end_sub = time.perf_counter()
         # print("preprocess sub time:", time_end_sub - time_start_sub)
-
         outputs = self.sess.run(None, {self.input_name: inp})
         time_end_sub = time.perf_counter()
         # print("infer sub time:", time_end_sub - time_start_sub)
         # 通常第一个输出就是 preds
         preds = outputs[0]
-
         boxes, scores, clses = self.postprocess_yolov8(
             preds, r, padw, padh, orig_w, orig_h,
             conf_thres=conf_thres, iou_thres=iou_thres
@@ -282,9 +298,9 @@ def detect_people(frame_p, return_debug=False):
     ROI(frame_p) -> target dict
     return_debug=True 时：额外返回 (boxes_person, scores_person, chosen_index, aim_point)
     """
-    boxes, scores, clses = ort_model.infer(frame_p, conf_thres=conf_c, iou_thres=0.45, imgsz=imgsz)
+    boxes, scores, clses = ort_model.infer(frame_p, conf_thres=conf_c, iou_thres=0.35, imgsz=area)
 
-    # print("unique clses:", np.unique(clses), "max score:", scores.max() if len(scores) else None)
+    print("unique clses:", np.unique(clses), "max score:", scores.max() if len(scores) else None)
     idx = np.where(clses == person_cls)[0]
     if idx.size == 0:
         empty = {"x1": 0, "y1": 0, "x2": 0, "y2": 0}
@@ -309,6 +325,8 @@ def detect_people(frame_p, return_debug=False):
     aim_x = int((x1 + x2) * 0.5)
     aim_y = int((y2 - y1) * 0.75 + y1)
     target = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+    print("boxes are:", b)
 
     if return_debug:
         return target, b, s, k, (aim_x, aim_y)
@@ -389,7 +407,7 @@ def get_movement(p):
     if p["x1"] == 0 and p["y1"] == 0 and p["x2"] == 0 and p["y2"] == 0:
         return 0, 0
     dx = -area//2 + int((p["x1"] + p["x2"]) * 0.5)
-    dy = -area//2 + int((p["y2"] - p["y1"]) * 0.75 + p["y1"])
+    dy = -area//2 + int((p["y2"] - p["y1"]) * 0.5 + p["y1"])
     # abs dx + abs dy < 5
     dp = dx ** 2 + dy ** 2
     if dp < min_d ** 2:
@@ -472,8 +490,8 @@ def auto_recoil():
     while True:
         if on and (mode == 0 or mode == 2) and mouse_down:
             # mouse_move_relative(0, int(base_recoil * (1 + level * 0.1)))
-            mouse_move_relative(0, 1)
-            time.sleep(0.08)
+            mouse_move_relative(0, 4)
+            time.sleep(0.04)
 
 
 
@@ -571,10 +589,15 @@ try:
 
         # --- show window ---
         if debug_show:
-            vis = draw_debug(frame, boxes=p_boxes, scores=p_scores, target_idx=chosen_k, aim_point=aim_pt)
-            cv2.imshow(win_name, vis)
-            if handle_debug_keys(win_name, vis):
-                break
+            if debug_show:
+                vis = draw_debug(frame, boxes=p_boxes, scores=p_scores,
+                                 target_idx=chosen_k, aim_point=aim_pt)
+
+                cv2.imshow(win_name, vis)
+
+                key = cv2.waitKey(1) & 0xFF  # ⭐关键：非阻塞刷新
+                # if handle_debug_keys(key):
+                #     break
 
         movement = get_movement(position)
         if movement[0] == 0 and movement[1] == 0:
@@ -583,20 +606,45 @@ try:
 
         if on and mouse_down:
             find = True
-            MAX_MOVE = 20
+            dx, dy = movement
 
-            dx = movement[0]
-            dy = movement[1]
+            # 单轴死区（抑制1~2像素抖动）
+            if abs(dx) <= AXIS_DEAD: dx = 0
+            if abs(dy) <= AXIS_DEAD: dy = 0
 
-            # 限制范围
+            # 分段增益：越接近越温柔
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < 10:
+                k = 0.40
+            elif dist < 25:
+                k = 0.5
+            else:
+                k = 0.55
+            dx = int(dx * k)
+            dy = int(dy * k)
+
+            # EMA 平滑
+            smooth_dx = SMOOTH * smooth_dx + (1 - SMOOTH) * dx
+            smooth_dy = SMOOTH * smooth_dy + (1 - SMOOTH) * dy
+            dx = int(round(smooth_dx))
+            dy = int(round(smooth_dy))
+
+            # 每帧变化率限制（避免忽快忽慢）
+            # dx = max(last_dx - MAX_DELTA, min(last_dx + MAX_DELTA, dx))
+            # dy = max(last_dy - MAX_DELTA, min(last_dy + MAX_DELTA, dy))
+
+            # 绝对限幅
             dx = max(-MAX_MOVE, min(MAX_MOVE, dx))
             dy = max(-MAX_MOVE, min(MAX_MOVE, dy))
 
-            mouse_move_relative(dx, dy)
+            last_dx, last_dy = dx, dy
+
+            if dx != 0 or dy != 0:
+                mouse_move_relative(dx, dy)
             print(f"move dx: {dx}, dy: {dy}")
 
         t4 = time.perf_counter()
         #print("move cost: ", t4 - t3)
-        print("loop cost:", t4 - t0)
+        #print("loop cost:", t4 - t0)
 finally:
     pass
