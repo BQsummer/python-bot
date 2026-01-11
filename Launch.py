@@ -16,6 +16,7 @@ import time
 import win32com.client
 import os
 import torch
+import threading, queue, time
 
 import interception
 from consts import interception_filter_key_state, interception_filter_mouse_state, interception_mouse_flag, \
@@ -45,7 +46,7 @@ os.makedirs(debug_save_dir, exist_ok=True)
 smooth_dx, smooth_dy = 0.0, 0.0
 last_dx, last_dy = 0, 0
 
-SMOOTH = 0.10      # 越大越稳但越慢
+SMOOTH = 0.1      # 越大越稳但越慢
 MAX_MOVE = 50       # 原来20，先降
 MAX_DELTA = 3      # 每帧变化限制
 AXIS_DEAD = 2      # 单轴死区
@@ -63,6 +64,27 @@ cuda_opts = {
     "arena_extend_strategy": "kNextPowerOfTwo",
     "do_copy_in_default_stream": 1,         # 有时对延迟更友好
 }
+
+frame_q = queue.Queue(maxsize=1)
+stop_flag = False
+
+
+def capture_loop():
+    global stop_flag
+    while not stop_flag:
+        f = camera.grab(region=region)
+        if f is None:
+            continue
+
+        f = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+
+        # 只保留最新帧
+        if frame_q.full():
+            try:
+                frame_q.get_nowait()
+            except queue.Empty:
+                pass
+        frame_q.put_nowait(f)
 
 
 def letterbox(im, new_shape=(area, area), color=(114, 114, 114)):
@@ -160,131 +182,109 @@ class YOLOv8ONNX:
                 providers=[("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
             )
             self.on_gpu = True
+        else:
+            self.sess = ort.InferenceSession(onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
+            self.on_gpu = False
 
+        self.input = self.sess.get_inputs()[0]
+        self.input_name = self.input.name
+        self.input_shape = self.input.shape
 
-        self.input_name = self.sess.get_inputs()[0].name
-        # 常见是 [1,3,320,320]，但也可能动态
-        self.input_shape = self.sess.get_inputs()[0].shape
+        self.output = self.sess.get_outputs()[0]
+        self.output_name = self.output.name
+
+        # IOBinding（每次复用，减少开销）
+        self.io = self.sess.io_binding()
 
     def preprocess(self, frame_bgr, imgsz=area):
-        # letterbox
+        # 如果 frame 已经是 (area, area)，直接走最短路径
+        if frame_bgr.shape[0] == imgsz and frame_bgr.shape[1] == imgsz:
+            img = frame_bgr.astype(np.float32, copy=False)
+            img *= (1.0 / 255.0)
+            img = np.transpose(img, (2, 0, 1))
+            img = np.expand_dims(img, 0)
+            # r=1, pad=0
+            return img, 1.0, 0.0, 0.0
+
+        # fallback：不是同尺寸才 letterbox
         img, r, (padw, padh) = letterbox(frame_bgr, (imgsz, imgsz))
-        # BGR -> RGB
-        # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        # HWC -> CHW
+        img = img.astype(np.float32, copy=False)
+        img *= (1.0 / 255.0)
         img = np.transpose(img, (2, 0, 1))
-        # Add batch
-        img = np.expand_dims(img, axis=0)
+        img = np.expand_dims(img, 0)
         return img, r, padw, padh
+
+    def infer(self, frame_bgr, conf_thres=0.4, iou_thres=0.35, imgsz=256):
+        orig_h, orig_w = frame_bgr.shape[:2]
+        inp, r, padw, padh = self.preprocess(frame_bgr, imgsz=imgsz)
+
+        # 绑定输入输出（减少内部拷贝/同步）
+        self.io.clear_binding_inputs()
+        self.io.clear_binding_outputs()
+
+        # 输入：CPU numpy -> ORT（ORT 会负责把它送到 CUDA；如果你想更极致，可以再做 pinned memory）
+        self.io.bind_cpu_input(self.input_name, inp)
+
+        # 输出：让 ORT 自己分配（也可以 bind 到固定 buffer）
+        self.io.bind_output(self.output_name)
+
+        self.sess.run_with_iobinding(self.io)
+        preds = self.io.copy_outputs_to_cpu()[0]
+
+        boxes, scores, clses = self.postprocess_yolov8(
+            preds, r, padw, padh, orig_w, orig_h,
+            conf_thres=conf_thres, iou_thres=iou_thres
+        )
+        return boxes, scores, clses
 
     def postprocess_yolov8(self, preds, r, padw, padh, orig_w, orig_h,
                            conf_thres=0.4, iou_thres=0.45):
-        """
-        支持常见 YOLOv8 ONNX 输出:
-        - (1, 84, 8400)
-        - (1, 8400, 84)
-        其中 84 = 4 + nc (nc=80)
-        """
-        t0 = time.perf_counter()
         pred = preds
-
-        # 统一成 (N, 4+nc)
         if pred.ndim == 3:
             pred = pred[0]
-        if pred.shape[0] in (84, 85, 4 + 80):  # (84, 8400)
-            pred = pred.transpose(1, 0)        # -> (8400, 84)
+        if pred.shape[0] in (84, 85, 4 + 80):
+            pred = pred.transpose(1, 0)
 
-        t1 = time.perf_counter()
-
-        # xywh + cls_scores
+        # 只取 person 类的 score（避免 argmax / cls_id 数组）
         xywh = pred[:, :4]
-        cls_scores = pred[:, 4:]  # (N, nc)
+        score = pred[:, 4 + person_cls]
 
-        # score = cls_scores[np.arange(cls_scores.shape[0]), cls_id]
-        #cls_id = np.argmax(cls_scores, axis=1)
-
-        score = cls_scores[:, person_cls]   # 只取一个类别分数
-        cls_id = np.full((cls_scores.shape[0],), person_cls, dtype=np.int64)
-
-
-        t2 = time.perf_counter()
-
-        # conf filter
         m = score >= conf_thres
+        if not np.any(m):
+            return (np.zeros((0, 4), np.float32),
+                    np.zeros((0,), np.float32),
+                    np.zeros((0,), np.int64))
+
         xywh = xywh[m]
         score = score[m]
-        cls_id = cls_id[m]
 
-        t3 = time.perf_counter()
-
-        if xywh.shape[0] == 0:
-            return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-
-        # xywh -> xyxy in letterboxed image space
-        x = xywh[:, 0]
-        y = xywh[:, 1]
-        w = xywh[:, 2]
+        # xywh -> xyxy
+        x = xywh[:, 0];
+        y = xywh[:, 1];
+        w = xywh[:, 2];
         h = xywh[:, 3]
-        x1 = x - w / 2
-        y1 = y - h / 2
-        x2 = x + w / 2
-        y2 = y + h / 2
-        boxes = np.stack([x1, y1, x2, y2], axis=1)
+        boxes = np.empty((xywh.shape[0], 4), dtype=np.float32)
+        boxes[:, 0] = x - w * 0.5
+        boxes[:, 1] = y - h * 0.5
+        boxes[:, 2] = x + w * 0.5
+        boxes[:, 3] = y + h * 0.5
 
-        # unpad + unscale back to original
+        # unpad + unscale
         boxes[:, [0, 2]] -= padw
         boxes[:, [1, 3]] -= padh
-        boxes /= r
+        boxes *= (1.0 / r)
 
-        # clip
-        boxes[:, 0] = np.clip(boxes[:, 0], 0, orig_w - 1)
-        boxes[:, 1] = np.clip(boxes[:, 1], 0, orig_h - 1)
-        boxes[:, 2] = np.clip(boxes[:, 2], 0, orig_w - 1)
-        boxes[:, 3] = np.clip(boxes[:, 3], 0, orig_h - 1)
-
-        # class-aware NMS（这里先按类别分组做，简单稳）
-        final_boxes = []
-        final_scores = []
-        final_cls = []
-
-        m = score >= conf_thres
-        boxes = boxes[m]
-        score = score[m]
-
-        if boxes.shape[0] == 0:
-            return np.zeros((0, 4), np.float32), np.zeros((0,), np.float32), np.zeros((0,), np.int64)
+        # clip（原地）
+        np.clip(boxes[:, 0], 0, orig_w - 1, out=boxes[:, 0])
+        np.clip(boxes[:, 1], 0, orig_h - 1, out=boxes[:, 1])
+        np.clip(boxes[:, 2], 0, orig_w - 1, out=boxes[:, 2])
+        np.clip(boxes[:, 3], 0, orig_h - 1, out=boxes[:, 3])
 
         keep = nms_opencv_xyxy(boxes, score, conf_thres=conf_thres, iou_thres=iou_thres)
         boxes = boxes[keep]
         scores = score[keep]
         clses = np.full((len(keep),), person_cls, dtype=np.int64)
-
-        t4 = time.perf_counter()
-
-        #print(f"reshape:{t1 - t0:.4f}  cls+filter:{t2 - t1:.4f}  decode:{t3 - t2:.4f}  nms:{t4 - t3:.4f}  total:{t4 - t0:.4f}")
-
         return boxes, scores, clses
-
-    def infer(self, frame_bgr, conf_thres=0.4, iou_thres=0.35, imgsz=256):
-        orig_h, orig_w = frame_bgr.shape[:2]
-        time_start_sub = time.perf_counter()
-        inp, r, padw, padh = self.preprocess(frame_bgr, imgsz=imgsz)
-        time_end_sub = time.perf_counter()
-        # print("preprocess sub time:", time_end_sub - time_start_sub)
-        outputs = self.sess.run(None, {self.input_name: inp})
-        time_end_sub = time.perf_counter()
-        # print("infer sub time:", time_end_sub - time_start_sub)
-        # 通常第一个输出就是 preds
-        preds = outputs[0]
-        boxes, scores, clses = self.postprocess_yolov8(
-            preds, r, padw, padh, orig_w, orig_h,
-            conf_thres=conf_thres, iou_thres=iou_thres
-        )
-        time_end_sub = time.perf_counter()
-        # print("postprocess sub time:", time_end_sub - time_start_sub)
-        return boxes, scores, clses
-
 
 # ----------------------------
 # Create model once (DON'T create every frame)
@@ -490,8 +490,8 @@ def auto_recoil():
     while True:
         if on and (mode == 0 or mode == 2) and mouse_down:
             # mouse_move_relative(0, int(base_recoil * (1 + level * 0.1)))
-            mouse_move_relative(0, 3)
-            time.sleep(0.04)
+            mouse_move_relative(0, 4)
+            time.sleep(0.03)
 
 
 
@@ -554,6 +554,13 @@ try:
     win_name = "ROI Debug"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 
+    cap_th = threading.Thread(target=capture_loop, daemon=True)
+    cap_th.start()
+
+    filt_tx, filt_ty = None, None
+    last_tx, last_ty = None, None
+    last_print_t = 0.0
+
     while True:
         # print("\n--- New Loop ---")
         t0 = time.perf_counter()
@@ -562,7 +569,7 @@ try:
             # time.sleep(0.001)
             continue
 
-        frame = camera.grab(region=region)  # 这里frame本身就是ROI (area x area)
+        frame = frame_q.get()
         t1 = time.perf_counter()
         #print("grab cost:", t1 - t0)
 
@@ -570,14 +577,14 @@ try:
             find = False
             continue
 
-        if frame.shape[2] == 4:
-            # 大概率是 BGRA 或 RGBA；先按 BGRA 处理（dxcam常见）
-            # print( "frame has 4 channels, convert BGRA->BGR")
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        else:
-            # 如果你现在看到红蓝反，那说明 frame 实际是 RGB
-            # print( "frame has 3 channels, convert RGB->BGR")
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # if frame.shape[2] == 4:
+        #     # 大概率是 BGRA 或 RGBA；先按 BGRA 处理（dxcam常见）
+        #     print( "frame has 4 channels, convert BGRA->BGR")
+        #     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        # else:
+        #     # 如果你现在看到红蓝反，那说明 frame 实际是 RGB
+        #     print( "frame has 3 channels, convert RGB->BGR")
+        #     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         t2 = time.perf_counter()
         #print("convert cost:", t2 - t1)
@@ -596,8 +603,8 @@ try:
         #         cv2.imshow(win_name, vis)
         #
         #         key = cv2.waitKey(1) & 0xFF  # ⭐关键：非阻塞刷新
-        #         # if handle_debug_keys(key):
-        #         #     break
+                # if handle_debug_keys(key):
+                #     break
 
         movement = get_movement(position)
         if movement[0] == 0 and movement[1] == 0:
@@ -606,45 +613,48 @@ try:
 
         if on and mouse_down:
             find = True
-            dx, dy = movement
+            # === 1. 统一瞄点（和 detect_people 保持一致） ===
+            cx = area // 2
+            cy = area // 2
 
-            # 单轴死区（抑制1~2像素抖动）
-            if abs(dx) <= AXIS_DEAD: dx = 0
-            if abs(dy) <= AXIS_DEAD: dy = 0
+            tx = int((position["x1"] + position["x2"]) * 0.5)
+            ty = int((position["y2"] - position["y1"]) * 0.5 + position["y1"])  # 和 detect_people 一致
 
-            # 分段增益：越接近越温柔
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist < 10:
-                k = 0.40
-            elif dist < 25:
-                k = 0.5
+            dx = tx - cx
+            dy = ty - cy
+
+            # === 2. 单轴死区（防止微抖） ===
+            if abs(dx) <= AXIS_DEAD:
+                dx = 0
+            if abs(dy) <= AXIS_DEAD:
+                dy = 0
+
+            if dx == 0 and dy == 0:
+                continue
+
+            # === 3. 距离相关比例增益（远快近稳） ===
+            dist2 = dx * dx + dy * dy
+            if dist2 > 40 * 40:
+                k = 0.85
+            elif dist2 > 20 * 20:
+                k = 0.6
             else:
-                k = 0.55
+                k = 0.35
+
             dx = int(dx * k)
             dy = int(dy * k)
 
-            # EMA 平滑
-            smooth_dx = SMOOTH * smooth_dx + (1 - SMOOTH) * dx
-            smooth_dy = SMOOTH * smooth_dy + (1 - SMOOTH) * dy
-            dx = int(round(smooth_dx))
-            dy = int(round(smooth_dy))
-
-            # 每帧变化率限制（避免忽快忽慢）
-            # dx = max(last_dx - MAX_DELTA, min(last_dx + MAX_DELTA, dx))
-            # dy = max(last_dy - MAX_DELTA, min(last_dy + MAX_DELTA, dy))
-
-            # 绝对限幅
+            # === 4. 对称限幅（非常重要，防止过冲） ===
             dx = max(-MAX_MOVE, min(MAX_MOVE, dx))
             dy = max(-MAX_MOVE, min(MAX_MOVE, dy))
 
-            last_dx, last_dy = dx, dy
-
+            # === 5. 执行移动 ===
             if dx != 0 or dy != 0:
                 mouse_move_relative(dx, dy)
             #print(f"move dx: {dx}, dy: {dy}")
 
-    t4 = time.perf_counter()
-        #print("move cost: ", t4 - t3)
-        #print("loop cost:", t4 - t0)
+            t4 = time.perf_counter()
+            #print("move cost: ", t4 - t3)
+            #print("loop cost:", t4 - t0)
 finally:
     pass
