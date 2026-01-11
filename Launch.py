@@ -400,9 +400,6 @@ def handle_debug_keys(win_name, vis_img):
     return False
 
 
-min_d = 5
-max_d = 80
-
 def get_movement(p):
     if p["x1"] == 0 and p["y1"] == 0 and p["x2"] == 0 and p["y2"] == 0:
         return 0, 0
@@ -410,10 +407,10 @@ def get_movement(p):
     dy = -area//2 + int((p["y2"] - p["y1"]) * 0.3 + p["y1"])
     # abs dx + abs dy < 5
     dp = dx ** 2 + dy ** 2
-    if dp < min_d ** 2:
+    if dp < AXIS_DEAD ** 2:
         return 0, 0
-    if dp > max_d ** 2:
-        return int(dx * max_d // sqrt(dp)), int(dy * max_d // sqrt(dp))
+    if dp > MAX_MOVE ** 2:
+        return int(dx * MAX_MOVE // sqrt(dp)), int(dy * MAX_MOVE // sqrt(dp))
     return dx, dy
 
 
@@ -635,11 +632,14 @@ try:
             # === 3. 距离相关比例增益（远快近稳） ===
             dist2 = dx * dx + dy * dy
             if dist2 > 40 * 40:
-                k = 0.85
+                k = 0.5
             elif dist2 > 20 * 20:
-                k = 0.6
+                k = 0.4
             else:
-                k = 0.35
+                k = 0.3
+
+            if dy > 0:
+                dy = int(dy * 0.9)  # 👈 向下减弱（0.6~0.8 可调）
 
             dx = int(dx * k)
             dy = int(dy * k)
