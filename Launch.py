@@ -1,27 +1,20 @@
-import threading
 from datetime import datetime
 from math import sqrt
-from random import randrange
 import onnxruntime as ort
 
 import dxcam
 import pythoncom
-from PIL import Image
-import torch
-import onnx
 import cv2
 import numpy as np
-from ultralytics import YOLO
-import time
 import win32com.client
 import os
-import torch
 import threading, queue, time
 
 import interception
 from consts import interception_filter_key_state, interception_filter_mouse_state, interception_mouse_flag, \
     interception_mouse_state
 from stroke import key_stroke, mouse_stroke
+from threading import Event
 
 
 
@@ -259,9 +252,9 @@ class YOLOv8ONNX:
         score = score[m]
 
         # xywh -> xyxy
-        x = xywh[:, 0];
-        y = xywh[:, 1];
-        w = xywh[:, 2];
+        x = xywh[:, 0]
+        y = xywh[:, 1]
+        w = xywh[:, 2]
         h = xywh[:, 3]
         boxes = np.empty((xywh.shape[0], 4), dtype=np.float32)
         boxes[:, 0] = x - w * 0.5
@@ -417,7 +410,7 @@ def get_movement(p):
 
 
 def add_listener():
-    global on, mouse_down, mouse_down_right
+    global on_ev, ldown_ev
     while True:
         de = c.wait()
         stroke = c.receive(de)
@@ -425,28 +418,23 @@ def add_listener():
         if type(stroke) is key_stroke:
             # print(stroke.code)
             if stroke.code == 25 and stroke.state == 1:
-                on = not on
-                mouse_down = False
-                print("switch: " + str(on))
+                if on_ev.is_set():
+                    on_ev.clear()
+                else:
+                    on_ev.set()
+                ldown_ev.clear()
+                print("switch: " + str(on_ev.is_set()))
             continue
         if type(stroke) is mouse_stroke:
             # print(str(stroke.state) + " " + " " + str(stroke.x) + " " + str(stroke.y) + " " + str(stroke.flags))
             if stroke.state == 1:
                 # print("switch 2: " + str(on))
-                mouse_down = True
+                ldown_ev.set()
                 continue
             if stroke.state == 2:
                 # print("switch 3: " + str(on))
-                mouse_down = False
+                ldown_ev.clear()
                 continue
-            # if stroke.state == 3:
-            #     #print("switch 2: " + str(on))
-            #     mouse_down_right = True
-            #     continue
-            # if stroke.state == 4:
-            #     #print("switch 3: " + str(on))
-            #     mouse_down_right = False
-            #     continue
 
 
 def switch_level():
@@ -459,23 +447,6 @@ def switch_level():
     else:
         level += 1
 
-def warning():
-    """
-    speak to warn about current config
-    :return:
-    """
-    global on, last_speak, speaker, find, level
-    now = time.time()
-    if speaker is None:
-        pythoncom.CoInitialize()
-        speaker = win32com.client.Dispatch("SAPI.SpVoice")
-        pythoncom.CoInitialize()
-    if on and find and now - last_speak > 2:
-        last_speak = now
-        speaker.Speak("锁")
-    if on and (mode == 0 or mode == 2) and now - last_speak > 10:
-        last_speak = now
-        speaker.Speak(level)
 
 
 def mouse_move_relative(x, y):
@@ -485,21 +456,19 @@ def mouse_move_relative(x, y):
 def auto_recoil():
     global find
     while True:
-        if on and (mode == 0 or mode == 2) and mouse_down:
+        if on_ev.is_set() and (mode == 0 or mode == 2) and ldown_ev.is_set():
             # mouse_move_relative(0, int(base_recoil * (1 + level * 0.1)))
-            mouse_move_relative(0, 4)
+            mouse_move_relative(0, 3)
             time.sleep(0.03)
 
 
 
 # sign
-on = False
+on_ev = Event()
 dev = True
 last_speak = 0
-mouse_down = False
-mouse_down_right = False
+ldown_ev = Event()
 find = False
-# recoil is 5~15, level count is 6 (0~5)
 level = 0
 
 # device = c.wait()
@@ -510,9 +479,7 @@ print("device = {}".format(device))
 c = interception.interception()
 c.set_filter(c.is_keyboard, interception_filter_key_state.INTERCEPTION_FILTER_KEY_UP.value | interception_filter_key_state.INTERCEPTION_FILTER_KEY_DOWN.value)
 c.set_filter(c.is_mouse, interception_filter_mouse_state.INTERCEPTION_FILTER_MOUSE_LEFT_BUTTON_DOWN.value
-             | interception_filter_mouse_state.INTERCEPTION_FILTER_MOUSE_LEFT_BUTTON_UP.value
-             | interception_filter_mouse_state.INTERCEPTION_FILTER_MOUSE_RIGHT_BUTTON_DOWN.value
-             | interception_filter_mouse_state.INTERCEPTION_FILTER_MOUSE_RIGHT_BUTTON_UP.value)
+             | interception_filter_mouse_state.INTERCEPTION_FILTER_MOUSE_LEFT_BUTTON_UP.value)
 
 listener_thread = threading.Thread(target=add_listener)
 listener_thread.daemon = True
@@ -521,18 +488,6 @@ listener_thread.start()
 
 # recoil
 threading.Thread(target=auto_recoil).start()
-
-
-# warning
-# pythoncom not support in a separate thread
-speaker = None
-speaker_thread = threading.Thread(target=warning)
-speaker_thread.daemon = True
-# speaker_thread.start()
-if speaker is None:
-    pythoncom.CoInitialize()
-    speaker = win32com.client.Dispatch("SAPI.SpVoice")
-    pythoncom.CoInitialize()
 
 
 # camera init
@@ -546,115 +501,113 @@ region = (left, top, right, bottom)
 print("left: {}, top: {}, right: {}, bottom: {}".format(left, top, right, bottom))
 
 
-try:
-    start = datetime.now()
-    win_name = "ROI Debug"
-    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 
-    cap_th = threading.Thread(target=capture_loop, daemon=True)
-    cap_th.start()
+start = datetime.now()
+win_name = "ROI Debug"
+cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 
-    filt_tx, filt_ty = None, None
-    last_tx, last_ty = None, None
-    last_print_t = 0.0
+cap_th = threading.Thread(target=capture_loop, daemon=True)
+cap_th.start()
 
-    while True:
-        # print("\n--- New Loop ---")
-        t0 = time.perf_counter()
-        if not on or mode == 2:
-            # 也可以在这里稍微sleep一下避免空转烧CPU
-            # time.sleep(0.001)
+filt_tx, filt_ty = None, None
+last_tx, last_ty = None, None
+last_print_t = 0.0
+
+while True:
+    # print("\n--- New Loop ---")
+    t0 = time.perf_counter()
+    if not on_ev.is_set() or mode == 2:
+        # 也可以在这里稍微sleep一下避免空转烧CPU
+        time.sleep(0.001)
+        continue
+
+    frame = frame_q.get()
+    t1 = time.perf_counter()
+    #print("grab cost:", t1 - t0)
+
+    if frame is None:
+        find = False
+        continue
+
+    # if frame.shape[2] == 4:
+    #     # 大概率是 BGRA 或 RGBA；先按 BGRA 处理（dxcam常见）
+    #     print( "frame has 4 channels, convert BGRA->BGR")
+    #     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    # else:
+    #     # 如果你现在看到红蓝反，那说明 frame 实际是 RGB
+    #     print( "frame has 3 channels, convert RGB->BGR")
+    #     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    t2 = time.perf_counter()
+    #print("convert cost:", t2 - t1)
+
+    # --- detect + debug data ---
+    position, p_boxes, p_scores, chosen_k, aim_pt = detect_people(frame, return_debug=True)
+    t3= time.perf_counter()
+    #print("detect cost:", t3 - t2)
+
+    # --- show window ---
+    # if debug_show:
+    #     if debug_show:
+    #         vis = draw_debug(frame, boxes=p_boxes, scores=p_scores,
+    #                          target_idx=chosen_k, aim_point=aim_pt)
+    #
+    #         cv2.imshow(win_name, vis)
+    #
+    #         key = cv2.waitKey(1) & 0xFF  # ⭐关键：非阻塞刷新
+            # if handle_debug_keys(key):
+            #     break
+
+    movement = get_movement(position)
+    if movement[0] == 0 and movement[1] == 0:
+        find = False
+        continue
+
+    if on_ev.is_set() and ldown_ev.is_set():
+        find = True
+        # === 1. 统一瞄点（和 detect_people 保持一致） ===
+        cx = area // 2
+        cy = area // 2
+
+        tx = int((position["x1"] + position["x2"]) * 0.5)
+        ty = int((position["y2"] - position["y1"]) * 0.3 + position["y1"])  # 和 detect_people 一致
+
+        dx = tx - cx
+        dy = ty - cy
+
+        # === 2. 单轴死区（防止微抖） ===
+        if abs(dx) <= AXIS_DEAD:
+            dx = 0
+        if abs(dy) <= AXIS_DEAD:
+            dy = 0
+
+        if dx == 0 and dy == 0:
             continue
 
-        frame = frame_q.get()
-        t1 = time.perf_counter()
-        #print("grab cost:", t1 - t0)
+        # === 3. 距离相关比例增益（远快近稳） ===
+        dist2 = dx * dx + dy * dy
+        if dist2 > 40 * 40:
+            k = 0.5
+        elif dist2 > 20 * 20:
+            k = 0.4
+        else:
+            k = 0.3
 
-        if frame is None:
-            find = False
-            continue
+        if dy > 0:
+            dy = int(dy * 0.9)  # 👈 向下减弱（0.6~0.8 可调）
 
-        # if frame.shape[2] == 4:
-        #     # 大概率是 BGRA 或 RGBA；先按 BGRA 处理（dxcam常见）
-        #     print( "frame has 4 channels, convert BGRA->BGR")
-        #     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        # else:
-        #     # 如果你现在看到红蓝反，那说明 frame 实际是 RGB
-        #     print( "frame has 3 channels, convert RGB->BGR")
-        #     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        dx = int(dx * k)
+        dy = int(dy * k)
 
-        t2 = time.perf_counter()
-        #print("convert cost:", t2 - t1)
+        # === 4. 对称限幅（非常重要，防止过冲） ===
+        dx = max(-MAX_MOVE, min(MAX_MOVE, dx))
+        dy = max(-MAX_MOVE, min(MAX_MOVE, dy))
 
-        # --- detect + debug data ---
-        position, p_boxes, p_scores, chosen_k, aim_pt = detect_people(frame, return_debug=True)
-        t3= time.perf_counter()
-        #print("detect cost:", t3 - t2)
+        # === 5. 执行移动 ===
+        if dx != 0 or dy != 0:
+            mouse_move_relative(dx, dy)
+        #print(f"move dx: {dx}, dy: {dy}")
 
-        # --- show window ---
-        # if debug_show:
-        #     if debug_show:
-        #         vis = draw_debug(frame, boxes=p_boxes, scores=p_scores,
-        #                          target_idx=chosen_k, aim_point=aim_pt)
-        #
-        #         cv2.imshow(win_name, vis)
-        #
-        #         key = cv2.waitKey(1) & 0xFF  # ⭐关键：非阻塞刷新
-                # if handle_debug_keys(key):
-                #     break
-
-        movement = get_movement(position)
-        if movement[0] == 0 and movement[1] == 0:
-            find = False
-            continue
-
-        if on and mouse_down:
-            find = True
-            # === 1. 统一瞄点（和 detect_people 保持一致） ===
-            cx = area // 2
-            cy = area // 2
-
-            tx = int((position["x1"] + position["x2"]) * 0.5)
-            ty = int((position["y2"] - position["y1"]) * 0.5 + position["y1"])  # 和 detect_people 一致
-
-            dx = tx - cx
-            dy = ty - cy
-
-            # === 2. 单轴死区（防止微抖） ===
-            if abs(dx) <= AXIS_DEAD:
-                dx = 0
-            if abs(dy) <= AXIS_DEAD:
-                dy = 0
-
-            if dx == 0 and dy == 0:
-                continue
-
-            # === 3. 距离相关比例增益（远快近稳） ===
-            dist2 = dx * dx + dy * dy
-            if dist2 > 40 * 40:
-                k = 0.5
-            elif dist2 > 20 * 20:
-                k = 0.4
-            else:
-                k = 0.3
-
-            if dy > 0:
-                dy = int(dy * 0.9)  # 👈 向下减弱（0.6~0.8 可调）
-
-            dx = int(dx * k)
-            dy = int(dy * k)
-
-            # === 4. 对称限幅（非常重要，防止过冲） ===
-            dx = max(-MAX_MOVE, min(MAX_MOVE, dx))
-            dy = max(-MAX_MOVE, min(MAX_MOVE, dy))
-
-            # === 5. 执行移动 ===
-            if dx != 0 or dy != 0:
-                mouse_move_relative(dx, dy)
-            #print(f"move dx: {dx}, dy: {dy}")
-
-            t4 = time.perf_counter()
-            #print("move cost: ", t4 - t3)
-            #print("loop cost:", t4 - t0)
-finally:
-    pass
+        t4 = time.perf_counter()
+        #print("move cost: ", t4 - t3)
+        #print("loop cost:", t4 - t0)
